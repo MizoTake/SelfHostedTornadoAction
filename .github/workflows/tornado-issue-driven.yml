@@ -56,7 +56,7 @@ jobs:
 
     defaults:
       run:
-        shell: pwsh
+        shell: powershell
 
     steps:
       # ── 1. リポジトリのチェックアウト ──
