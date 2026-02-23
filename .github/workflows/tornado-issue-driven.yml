@@ -1,0 +1,340 @@
+name: "Tornado: Issue-Driven Multi-Agent Development"
+
+on:
+  issues:
+    types: [opened, labeled]
+  issue_comment:
+    types: [created]
+
+# 同時実行を制御（同一issueに対して1つだけ実行）
+concurrency:
+  group: tornado-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  tornado-run:
+    name: "Run Tornado Agent"
+    runs-on: [self-hosted, Windows]
+
+    # トリガー条件:
+    #   A) Issue opened で tornado ラベルあり
+    #   B) labeled イベントで、付与されたラベルが tornado の時だけ
+    #   C) Issue コメントが /tornado で始まり、tornado ラベルあり、PR ではない
+    if: >-
+      (
+        github.event_name == 'issues'
+        && github.event.action == 'opened'
+        && contains(github.event.issue.labels.*.name, 'tornado')
+      )
+      || (
+        github.event_name == 'issues'
+        && github.event.action == 'labeled'
+        && github.event.label.name == 'tornado'
+      )
+      || (
+        github.event_name == 'issue_comment'
+        && contains(github.event.issue.labels.*.name, 'tornado')
+        && !github.event.issue.pull_request
+        && startsWith(github.event.comment.body, '/tornado')
+      )
+
+    timeout-minutes: 60
+
+    env:
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      TORNADO_NPM_PACKAGE: "@mizchi/tornado@0.4.0"
+      # Unity 関連（必要に応じてリポジトリ Secrets / Variables で上書き）
+      UNITY_EDITOR_PATH: ${{ vars.UNITY_EDITOR_PATH || 'C:\Program Files\Unity\Hub\Editor' }}
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      # ── 1. リポジトリのチェックアウト ──
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Node.js セットアップ ──
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # ── 3. gh CLI の確認 ──
+      - name: Verify gh CLI
+        run: |
+          gh --version
+          gh auth status
+
+      # ── 4. Issue 情報の取得・パース ──
+      # セキュリティ: Issue/コメント内容は gh CLI 経由で取得し、
+      #   ${{ }} の直接展開によるインジェクションを回避
+      - name: Fetch issue body and build plan
+        id: parse-issue
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          REPO: ${{ github.repository }}
+        run: |
+          $PlanFile = Join-Path $env:RUNNER_TEMP "tornado_plan_$($env:ISSUE_NUMBER).md"
+
+          # Issue body を gh CLI 経由で安全に取得
+          gh issue view $env:ISSUE_NUMBER --json body --jq '.body' | Out-File -FilePath $PlanFile -Encoding utf8
+
+          # コメントトリガーの場合: コメント本文を gh API から安全に取得
+          if ($env:EVENT_NAME -eq 'issue_comment' -and $env:COMMENT_ID) {
+            $CommentBody = gh api "/repos/$($env:REPO)/issues/comments/$($env:COMMENT_ID)" --jq '.body'
+
+            # /tornado プレフィックスを除去して追加指示として扱う
+            $ExtraInstruction = $CommentBody -replace '^/tornado\s*', ''
+
+            if ($ExtraInstruction) {
+              "`n---`n## Additional Instructions`n`n$ExtraInstruction" | Out-File -FilePath $PlanFile -Append -Encoding utf8
+            }
+          }
+
+          "plan_file=$PlanFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 5. Issue タイトルの安全な取得 ──
+      - name: Fetch issue title
+        id: issue-meta
+        run: |
+          $Title = gh issue view $env:ISSUE_NUMBER --json title --jq '.title'
+          "title=$Title" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 6. 実行開始を Issue にコメント ──
+      - name: Notify execution start
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          $BranchName = "tornado/issue-$($env:ISSUE_NUMBER)"
+          $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+
+          $Body = @"
+          🌪️ **Tornado 実行開始**
+
+          | 項目 | 値 |
+          |------|-----|
+          | Run ID | [``$($env:RUN_ID)``]($($env:RUN_URL)) |
+          | トリガー | ``$($env:EVENT_NAME)`` |
+          | ブランチ | ``$BranchName`` |
+          | Runner OS | Windows (Unity対応) |
+          | 開始時刻 | $Timestamp |
+
+          処理中です。完了後にこの Issue にレポートします...
+          "@
+
+          gh issue comment $env:ISSUE_NUMBER --body $Body
+
+      # ── 7. 作業ブランチの作成 ──
+      - name: Create or switch to working branch
+        run: |
+          $BranchName = "tornado/issue-$($env:ISSUE_NUMBER)"
+
+          # リモートブランチの存在確認
+          $RemoteRef = git ls-remote --heads origin $BranchName 2>$null
+          if ($RemoteRef) {
+            git fetch origin $BranchName
+            git checkout -B $BranchName "origin/$BranchName"
+          } else {
+            git checkout -b $BranchName origin/main
+          }
+
+          "BRANCH_NAME=$BranchName" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ── 8. Tornado 実行 ──
+      - name: Install and run Tornado
+        id: tornado
+        run: |
+          $PlanFile = "${{ steps.parse-issue.outputs.plan_file }}"
+          $LogFile = Join-Path $env:RUNNER_TEMP "tornado_output_$($env:ISSUE_NUMBER).log"
+
+          Write-Host "::group::Tornado Execution"
+
+          # tornado.json があれば plan を作業ディレクトリにコピー
+          if (Test-Path "./tornado.json") {
+            Write-Host "Using tornado.json config..."
+            Copy-Item $PlanFile -Destination "./.tornado_plan_tmp.md"
+            $ExecPlan = "./.tornado_plan_tmp.md"
+          } else {
+            Write-Host "Running with plan file directly..."
+            $ExecPlan = $PlanFile
+          }
+
+          # Tornado 実行（終了コードを明示的にキャプチャ）
+          $ExitCode = 0
+          try {
+            npx -y $env:TORNADO_NPM_PACKAGE $ExecPlan --dev=claude --review=codex 2>&1 | Tee-Object -FilePath $LogFile
+            $ExitCode = $LASTEXITCODE
+          } catch {
+            $ExitCode = 1
+            $_ | Out-File -FilePath $LogFile -Append -Encoding utf8
+          }
+
+          # 一時ファイル削除（git add される前に）
+          Remove-Item -Path "./.tornado_plan_tmp.md" -ErrorAction SilentlyContinue
+
+          Write-Host "::endgroup::"
+
+          "exit_code=$ExitCode" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "log_file=$LogFile" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 9. 変更の検出とコミット ──
+      - name: Commit changes
+        id: commit
+        env:
+          ISSUE_TITLE: ${{ steps.issue-meta.outputs.title }}
+        run: |
+          git config user.name "tornado-bot"
+          git config user.email "tornado-bot@users.noreply.github.com"
+
+          # 一時ファイルを除外
+          ".tornado_plan_tmp.md" | Out-File -FilePath ".git/info/exclude" -Append -Encoding utf8
+
+          # 変更があるか確認
+          $Status = git status --porcelain
+          if ($Status) {
+            git add -A
+            git commit -m "🌪️ tornado: Issue #$($env:ISSUE_NUMBER) - $($env:ISSUE_TITLE)"
+            git push origin $env:BRANCH_NAME --force-with-lease
+            "has_changes=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            "has_changes=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      # ── 10. Pull Request の作成 ──
+      - name: Create or update Pull Request
+        if: steps.commit.outputs.has_changes == 'true'
+        id: pr
+        env:
+          ISSUE_TITLE: ${{ steps.issue-meta.outputs.title }}
+        run: |
+          # 既存PRがあるか確認
+          $ExistingPR = gh pr list --head $env:BRANCH_NAME --json number --jq '.[0].number // empty'
+
+          if ($ExistingPR) {
+            "pr_number=$ExistingPR" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host "PR #$ExistingPR already exists, pushed new commits."
+          } else {
+            $PrBody = @"
+          ## Tornado Auto-Generated PR
+
+          **Source Issue:** #$($env:ISSUE_NUMBER)
+          **Agent Config:** dev=claude, review=codex
+          **Runner:** Windows (Unity対応)
+
+          ---
+
+          このPRは Tornado マルチエージェントオーケストレータにより自動生成されました。
+          Issue の内容に基づいてコード変更を行っています。
+
+          レビュー後にマージしてください。
+          "@
+
+            $PrUrl = gh pr create `
+              --title "🌪️ [Tornado] Issue #$($env:ISSUE_NUMBER): $($env:ISSUE_TITLE)" `
+              --body $PrBody `
+              --head $env:BRANCH_NAME `
+              --base main
+
+            # PR番号を抽出
+            $PrNumber = ($PrUrl -split '/')[-1]
+            "pr_number=$PrNumber" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+
+      # ── 11. 結果を Issue にレポート ──
+      - name: Report results to issue
+        if: always()
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          $ExitCode = "${{ steps.tornado.outputs.exit_code }}"
+          $HasChanges = "${{ steps.commit.outputs.has_changes }}"
+          $PrNumber = "${{ steps.pr.outputs.pr_number }}"
+          $LogFile = "${{ steps.tornado.outputs.log_file }}"
+          $Timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss 'UTC'")
+
+          # ログの末尾を抽出
+          if ($LogFile -and (Test-Path $LogFile)) {
+            $LogLines = Get-Content $LogFile -Tail 100 -ErrorAction SilentlyContinue
+            $LogTail = ($LogLines -join "`n")
+            if ($LogTail.Length -gt 3000) {
+              $LogTail = $LogTail.Substring($LogTail.Length - 3000)
+            }
+          } else {
+            $LogTail = "(ログなし)"
+          }
+
+          # ステータスの判定
+          if ($ExitCode -eq "0") {
+            $Status = "✅ 成功"
+            $Emoji = "🎉"
+          } else {
+            $Status = "❌ 失敗 (exit code: $ExitCode)"
+            $Emoji = "⚠️"
+          }
+
+          # PR情報
+          if ($PrNumber) {
+            $PrInfo = "**Pull Request:** #$PrNumber"
+          } elseif ($HasChanges -eq "false") {
+            $PrInfo = "**変更なし:** コード変更は検出されませんでした"
+          } else {
+            $PrInfo = "**PR:** 未作成"
+          }
+
+          $Body = @"
+          $Emoji **Tornado 実行完了**
+
+          | 項目 | 値 |
+          |------|-----|
+          | ステータス | $Status |
+          | 完了時刻 | $Timestamp |
+          | Actions Run | [ログを確認]($($env:RUN_URL)) |
+
+          $PrInfo
+
+          <details>
+          <summary>📋 実行ログ（末尾）</summary>
+
+          ``````
+          $LogTail
+          ``````
+
+          </details>
+
+          ---
+          💡 追加の修正が必要な場合は、このIssueに ``/tornado <追加指示>`` とコメントしてください。
+          "@
+
+          gh issue comment $env:ISSUE_NUMBER --body $Body
+
+      # ── 12. 失敗時のラベル付与 ──
+      - name: Label on failure
+        if: failure()
+        run: |
+          gh issue edit $env:ISSUE_NUMBER --add-label "tornado-failed"
+
+      # ── 13. 一時ファイルのクリーンアップ ──
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          $PlanFile = Join-Path $env:RUNNER_TEMP "tornado_plan_$($env:ISSUE_NUMBER).md"
+          $LogFile = Join-Path $env:RUNNER_TEMP "tornado_output_$($env:ISSUE_NUMBER).log"
+
+          Remove-Item -Path $PlanFile -ErrorAction SilentlyContinue
+          Remove-Item -Path $LogFile -ErrorAction SilentlyContinue
+          Remove-Item -Path "./.tornado_plan_tmp.md" -ErrorAction SilentlyContinue
